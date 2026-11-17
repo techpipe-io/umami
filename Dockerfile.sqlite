@@ -1,6 +1,6 @@
-# SQLite variant: the Maxime-J fork contains application-level SQLite changes.
-# This is NOT the official Umami 3.5.0 image: do not mix its files with the
-# official image. Only update the Node.js executable in this fork image.
+# SQLite variant: reuse the Maxime-J fork and patch only its Node.js runtime
+# plus the shared libraries required by the new Node.js binary.
+# Do not mix application files or database schemas with official Umami.
 ARG SQLITE_BASE=ghcr.io/maxime-j/umami-sqlite:latest
 ARG SQLITE_NODE_VERSION=26.13.1
 ARG NODE_FLAVOR=alpine
@@ -11,12 +11,36 @@ ARG SQLITE_BASE
 FROM ${SQLITE_BASE}
 
 ARG SQLITE_NODE_VERSION
+ARG NODE_FLAVOR
+# Pass the exact original image Config.User (username, UID or UID:GID).
+# If Config.User was empty, pass 'root'. Required to avoid changing the runtime user.
+ARG SQLITE_RUNTIME_USER
 
-# Preserve the fork's application, libraries, USER, ENTRYPOINT, CMD and volumes.
+USER root
+# Node Alpine needs libatomic and libstdc++; the original fork may lack them.
+# For Debian/Ubuntu, install the equivalent runtime libraries.
+RUN test -n "${SQLITE_RUNTIME_USER}" \
+    && case "${NODE_FLAVOR}" in \
+         alpine) \
+           test -f /etc/alpine-release \
+           && apk add --no-cache libatomic libstdc++ \
+           ;; \
+         bookworm-slim) \
+           test -f /etc/debian_version \
+           && apt-get update \
+           && apt-get install -y --no-install-recommends libatomic1 libstdc++6 \
+           && rm -rf /var/lib/apt/lists/* \
+           ;; \
+         *) echo "Unsupported NODE_FLAVOR=${NODE_FLAVOR}" >&2; exit 1 ;; \
+       esac
+
 COPY --from=patched-node /usr/local/bin/node /usr/local/bin/node
 ENV NODE_VERSION=${SQLITE_NODE_VERSION}
 
-# Fail the build if the patched runtime is not executable in the fork's OS.
+# Restore the fork's runtime identity, including any original group setting.
+USER ${SQLITE_RUNTIME_USER}
+
+# Detect missing libraries, architecture mismatches, and broken Node built-ins.
 RUN test "$(command -v node)" = '/usr/local/bin/node' \
     && test "$(node --version)" = "v${SQLITE_NODE_VERSION}" \
     && node -e "require('node:fs'); require('node:crypto')"
