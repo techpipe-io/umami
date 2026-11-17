@@ -157,6 +157,7 @@ jobs:
     outputs:
       node_flavor: ${{ steps.inspect.outputs.node_flavor }}
       upstream_uid: ${{ steps.inspect.outputs.upstream_uid }}
+      upstream_user: ${{ steps.inspect.outputs.upstream_user }}
       patched_version: ${{ steps.inspect.outputs.patched_version }}
       source_ref: ${{ steps.inspect.outputs.source_ref }}
     steps:
@@ -182,8 +183,11 @@ jobs:
             *) echo "SQLite upstream uses unsupported Node.js version: $upstream_node" >&2; exit 1 ;;
           esac
           upstream_uid="$(docker run --rm --entrypoint id "$SQLITE_BASE" -u)"
+          upstream_user="$(docker image inspect "$SQLITE_BASE" --format '{{.Config.User}}')"
+          [[ -n "$upstream_user" ]] || upstream_user=root
           echo "node_flavor=$node_flavor" >> "$GITHUB_OUTPUT"
           echo "upstream_uid=$upstream_uid" >> "$GITHUB_OUTPUT"
+          echo "upstream_user=$upstream_user" >> "$GITHUB_OUTPUT"
           echo "patched_version=$patched_version" >> "$GITHUB_OUTPUT"
           echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
           printf 'SQLite base: %s, Node.js %s, OS %s, UID %s\n' \
@@ -226,6 +230,7 @@ jobs:
             SQLITE_BASE=${{ needs.inspect-sqlite-upstream.outputs.source_ref }}
             SQLITE_NODE_VERSION=${{ env.SQLITE_NODE_VERSION }}
             NODE_FLAVOR=${{ needs.inspect-sqlite-upstream.outputs.node_flavor }}
+            SQLITE_RUNTIME_USER=${{ needs.inspect-sqlite-upstream.outputs.upstream_user }}
 
       - name: Verify Node, UID, architecture and SQLite functionality
         shell: bash
@@ -233,11 +238,14 @@ jobs:
           TEST_IMAGE: umami-sqlite:ci-${{ matrix.suffix }}
           EXPECTED_ARCH: ${{ matrix.suffix }}
           EXPECTED_UID: ${{ needs.inspect-sqlite-upstream.outputs.upstream_uid }}
+          EXPECTED_USER: ${{ needs.inspect-sqlite-upstream.outputs.upstream_user }}
         run: |
           set -euo pipefail
           node_version="$(docker run --rm --entrypoint node "$TEST_IMAGE" --version)"
           runtime_uid="$(docker run --rm --entrypoint id "$TEST_IMAGE" -u)"
           actual_arch="$(docker image inspect "$TEST_IMAGE" --format '{{.Architecture}}')"
+          actual_user="$(docker image inspect "$TEST_IMAGE" --format '{{.Config.User}}')"
+          test "$actual_user" = "$EXPECTED_USER"
           test "$node_version" = "v${SQLITE_NODE_VERSION}"
           test "$runtime_uid" = "$EXPECTED_UID"
           test "$actual_arch" = "$EXPECTED_ARCH"
@@ -322,6 +330,7 @@ jobs:
             SQLITE_BASE=${{ needs.inspect-sqlite-upstream.outputs.source_ref }}
             SQLITE_NODE_VERSION=${{ env.SQLITE_NODE_VERSION }}
             NODE_FLAVOR=${{ needs.inspect-sqlite-upstream.outputs.node_flavor }}
+            SQLITE_RUNTIME_USER=${{ needs.inspect-sqlite-upstream.outputs.upstream_user }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: mode=min
