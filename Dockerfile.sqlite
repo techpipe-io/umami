@@ -1,0 +1,22 @@
+# SQLite variant: the Maxime-J fork contains application-level SQLite changes.
+# This is NOT the official Umami 3.5.0 image: do not mix its files with the
+# official image. Only update the Node.js executable in this fork image.
+ARG SQLITE_BASE=ghcr.io/maxime-j/umami-sqlite:latest
+ARG SQLITE_NODE_VERSION=26.13.1
+ARG NODE_FLAVOR=alpine
+
+FROM node:${SQLITE_NODE_VERSION}-${NODE_FLAVOR} AS patched-node
+
+ARG SQLITE_BASE
+FROM ${SQLITE_BASE}
+
+ARG SQLITE_NODE_VERSION
+
+# Preserve the fork's application, libraries, USER, ENTRYPOINT, CMD and volumes.
+COPY --from=patched-node /usr/local/bin/node /usr/local/bin/node
+ENV NODE_VERSION=${SQLITE_NODE_VERSION}
+
+# Fail the build if the patched runtime is not executable in the fork's OS.
+RUN test "$(command -v node)" = '/usr/local/bin/node' \
+    && test "$(node --version)" = "v${SQLITE_NODE_VERSION}" \
+    && node -e "require('node:fs'); require('node:crypto')"
