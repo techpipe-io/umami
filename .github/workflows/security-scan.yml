@@ -1,0 +1,123 @@
+name: Scan Umami and upstream Docker images
+
+on:
+  schedule:
+    - cron: '37 3 * * *'
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - Build patched Umami image
+    types:
+      - completed
+
+permissions:
+  contents: read
+  packages: read
+  issues: write
+
+concurrency:
+  group: umami-security-scan
+  cancel-in-progress: false
+
+jobs:
+  trivy:
+    name: Scan ${{ matrix.target }} (${{ matrix.arch }})
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event != 'pull_request')
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        target: [patched-umami, patched-sqlite, upstream-umami, upstream-sqlite, node-22, node-24, node-26]
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Select image from pinned build configuration
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          # The SQLite published tag must match the fork's actual Node major.
+          # Update this selector when the fork changes Node major or when changing its patched version.
+          pg_version="$(sed -n 's/^ARG UMAMI_VERSION=//p' Dockerfile | head -1)"
+          pg_node="$(sed -n 's/^ARG NODE_VERSION=//p' Dockerfile | head -1)"
+          sqlite_node="$(sed -n 's/^ARG SQLITE_NODE_VERSION=//p' Dockerfile.sqlite | head -1)"
+          # The SQLite build chooses the patched version matching the fork's
+          # major version, so the published tag may differ from Dockerfile default.
+          if [[ '${{ matrix.target }}' == 'patched-sqlite' ]]; then
+            docker pull ghcr.io/maxime-j/umami-sqlite:latest >/dev/null
+            fork_node="$(docker run --rm --entrypoint node ghcr.io/maxime-j/umami-sqlite:latest --version)"
+            case "$fork_node" in
+              v22.*) sqlite_node="$(python3 -c 'import json; print(json.load(open("monitor/upstreams.json"))["node_versions"]["22"])')" ;;
+              v24.*) sqlite_node="$(python3 -c 'import json; print(json.load(open("monitor/upstreams.json"))["node_versions"]["24"])')" ;;
+              v26.*) sqlite_node="$(python3 -c 'import json; print(json.load(open("monitor/upstreams.json"))["node_versions"]["26"])')" ;;
+              *) echo "Unsupported fork Node runtime: $fork_node" >&2; exit 1 ;;
+            esac
+          fi
+          case '${{ matrix.target }}' in
+            patched-umami)  ref="ghcr.io/${owner}/umami:${pg_version}-node${pg_node}" ;;
+            patched-sqlite) ref="ghcr.io/${owner}/umami-sqlite:node${sqlite_node}" ;;
+            upstream-umami) ref="ghcr.io/umami-software/umami:${pg_version}" ;;
+            upstream-sqlite) ref='ghcr.io/maxime-j/umami-sqlite:latest' ;;
+            node-22)         ref="node:$(python3 -c 'import json; print(json.load(open("monitor/upstreams.json"))["node_versions"]["22"])')-alpine" ;;
+            node-24)         ref="node:$(python3 -c 'import json; print(json.load(open("monitor/upstreams.json"))["node_versions"]["24"])')-alpine" ;;
+            node-26)         ref="node:$(python3 -c 'import json; print(json.load(open("monitor/upstreams.json"))["node_versions"]["26"])')-alpine" ;;
+            *) echo 'Unknown matrix target' >&2; exit 1 ;;
+          esac
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Scanning ${ref} for linux/${{ matrix.arch }}"
+
+      - name: Authenticate to GHCR for private packages
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan OS and application dependencies with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/${{ matrix.arch }}
+        with:
+          image-ref: ${{ steps.image.outputs.ref }}
+          format: json
+          output: trivy.json
+          scanners: vuln
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          exit-code: '0'
+          cache: 'true'
+
+      - name: Summarize vulnerabilities and generate alert
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          python3 scripts/report_security.py \
+            --report trivy.json --target "$TARGET" --arch "$ARCH" \
+            --image "$IMAGE_REF" --out security-signal.json \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or resolve security issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          python3 scripts/sync_alerts.py --namespace security \
+            --scope "${TARGET}-${ARCH}" --input security-signal.json
+
+      - name: Preserve full JSON findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-${{ matrix.target }}-${{ matrix.arch }}
+          path: trivy.json
+          retention-days: 30
+          if-no-files-found: warn
